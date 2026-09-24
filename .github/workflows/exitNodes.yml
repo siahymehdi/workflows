@@ -232,7 +232,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          TAILSCALE_HOSTNAME="github-exitnode-${GITHUB_RUN_ID}"
+          TAILSCALE_HOSTNAME="exitnode"
 
           echo "Installing Tailscale..."
           curl -fsSL https://tailscale.com/install.sh | sh
