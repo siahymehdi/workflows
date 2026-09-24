@@ -429,3 +429,39 @@ jobs:
               sleep "$sleep_seconds"
             fi
           done
+		  
+		      # ==========================================================
+      # 11. Disconnect Tailscale
+      #
+      # IMPORTANT:
+      # Always execute this step, even if an earlier step fails.
+      #
+      # The auth key should be ephemeral, so the Tailscale node
+      # will also disappear from the tailnet after the runner is
+      # destroyed.
+      # ==========================================================
+
+      - name: 11. Disconnect Tailscale
+        if: always()
+        run: |
+          set -euo pipefail
+
+          echo "Checking Tailscale state..."
+
+          if command -v tailscale >/dev/null 2>&1; then
+            echo "Current Tailscale status:"
+            sudo tailscale status || true
+
+            echo
+            echo "Disconnecting Tailscale..."
+
+            sudo tailscale down || true
+
+            echo
+            echo "Tailscale status after disconnect:"
+            sudo tailscale status || true
+          else
+            echo "Tailscale is not installed. Nothing to disconnect."
+          fi
+
+          echo "Tailscale cleanup completed."
