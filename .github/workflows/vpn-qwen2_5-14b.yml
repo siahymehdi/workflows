@@ -20,7 +20,7 @@ env:
 
   # Ollama (Qwen 3.8 27B only)
   OLLAMA_PORT: '11434'
-  OLLAMA_MODEL: 'qwen2.5:14b'
+  OLLAMA_MODEL: 'qwen3.8:27b'
   OLLAMA_MIN_VERSION: '0.32.12'
   OLLAMA_CONTEXT_LENGTH: '8192'
 
@@ -599,16 +599,32 @@ jobs:
           sudo systemctl enable ollama.service
           sudo systemctl restart ollama.service
 
-          # Ollama has no built-in API authentication. Permit access to
-          # its port only through Tailscale (and localhost), not other
-          # runner network interfaces.
-          sudo iptables -C INPUT ! -i tailscale0 ! -i lo -p tcp --dport "$OLLAMA_PORT" -j DROP 2>/dev/null ||
-            sudo iptables -I INPUT 1 ! -i tailscale0 ! -i lo -p tcp --dport "$OLLAMA_PORT" -j DROP
+                  # Ollama has no built-in API authentication. Allow its port only
+          # on localhost and Tailscale; drop it everywhere else.
+          # nf_tables iptables allows only one -i per rule, so use
+          # separate ACCEPT rules followed by a DROP rule.
+          add_ollama_firewall() {
+            local IPT="$1"
 
-          if command -v ip6tables >/dev/null 2>&1; then
-            sudo ip6tables -C INPUT ! -i tailscale0 ! -i lo -p tcp --dport "$OLLAMA_PORT" -j DROP 2>/dev/null ||
-              sudo ip6tables -I INPUT 1 ! -i tailscale0 ! -i lo -p tcp --dport "$OLLAMA_PORT" -j DROP
-          fi
+            command -v "$IPT" >/dev/null 2>&1 || return 0
+
+            # Inserted at position 1 in reverse order, so the final order is:
+            # ACCEPT lo, ACCEPT tailscale0, DROP
+            sudo "$IPT" -C INPUT -p tcp --dport "$OLLAMA_PORT" -j DROP 2>/dev/null ||
+              sudo "$IPT" -I INPUT 1 -p tcp --dport "$OLLAMA_PORT" -j DROP
+
+            sudo "$IPT" -C INPUT -i tailscale0 -p tcp --dport "$OLLAMA_PORT" -j ACCEPT 2>/dev/null ||
+              sudo "$IPT" -I INPUT 1 -i tailscale0 -p tcp --dport "$OLLAMA_PORT" -j ACCEPT
+
+            sudo "$IPT" -C INPUT -i lo -p tcp --dport "$OLLAMA_PORT" -j ACCEPT 2>/dev/null ||
+              sudo "$IPT" -I INPUT 1 -i lo -p tcp --dport "$OLLAMA_PORT" -j ACCEPT
+          }
+
+          add_ollama_firewall iptables
+          add_ollama_firewall ip6tables || echo "::warning::ip6tables rules could not be applied."
+
+          echo "Firewall rules for port $OLLAMA_PORT:"
+          sudo iptables -S INPUT | grep -- "--dport $OLLAMA_PORT" || true
 
           for i in $(seq 1 30); do
             if curl -fsS --max-time 5 \
