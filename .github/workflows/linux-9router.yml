@@ -1,4 +1,4 @@
-name: Linux 9Router Server
+name: Linux Vpn Server
 
 on:
   # The workflow starts manually.
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: permanent-9router-server
+  group: permanent-vpn-server
   cancel-in-progress: false
 
 # Step 25 dispatches the next run with GITHUB_TOKEN, which needs
@@ -30,11 +30,9 @@ jobs:
       NINEROUTER_MODEL_TEST_TIMEOUT_SECONDS: '45'
       NINEROUTER_MODEL_TEST_PARALLELISM: '6'
       NINEROUTER_MAX_MODELS_PER_CYCLE: '100'
-      NINEROUTER_DB_PATH: 'backup/9router/db/data.sqlite'
-      NINEROUTER_BASE_URL: 'http://127.0.0.1:20128'
 
       # This workflow owns exactly one canonical machine name.
-      TAILSCALE_HOSTNAME: '9router'
+      TAILSCALE_HOSTNAME: 'Vpn'
 
     steps:
 
@@ -68,8 +66,7 @@ jobs:
             SSH_USERNAME
             SSH_PASSWORD
             TAILSCALE_AUTHKEY
-            TAILSCALE_API_KEY
-            NINEROUTER_ENV
+            TAILSCALE_API_KEY            
             JWT_SECRET
             TELEGRAM_BOT_TOKEN
             TELEGRAM_CHAT_ID
@@ -285,285 +282,6 @@ jobs:
           fi
 
           echo "IP forwarding configured successfully."
-
-      # ==========================================================
-      # 09. Prepare 9Router directory
-      # ==========================================================
-
-      - name: 09. Prepare 9Router Directory
-        env:
-          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
-        run: |
-          set -euo pipefail
-
-          NINEROUTER_HOME="/home/$SSH_USERNAME/.9router"
-
-          sudo mkdir -p "$NINEROUTER_HOME/db"
-
-          sudo chown -R \
-            "$SSH_USERNAME:$SSH_USERNAME" \
-            "$NINEROUTER_HOME"
-
-          sudo chmod 700 \
-            "$NINEROUTER_HOME"
-
-          echo "Prepared: $NINEROUTER_HOME"
-
-      # ==========================================================
-      # 10. Restore SQLite database
-      # ==========================================================
-
-      - name: 10. Restore 9Router SQLite Database
-        env:
-          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
-        run: |
-          set -euo pipefail
-
-          SOURCE_DB="$GITHUB_WORKSPACE/$NINEROUTER_DB_PATH"
-          TARGET_DB="/home/$SSH_USERNAME/.9router/db/data.sqlite"
-
-          if [[ -f "$SOURCE_DB" ]]; then
-            echo "Restoring 9Router database..."
-
-            sudo install \
-              -o "$SSH_USERNAME" \
-              -g "$SSH_USERNAME" \
-              -m 600 \
-              "$SOURCE_DB" \
-              "$TARGET_DB"
-
-            echo "Database restored."
-          else
-            echo "No previous 9Router database found."
-            echo "9Router will initialize a new database."
-          fi
-
-      # ==========================================================
-      # 11. Restore .env
-      # ==========================================================
-
-      - name: 11. Restore 9Router Environment
-        env:
-          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
-          NINEROUTER_ENV: ${{ secrets.NINEROUTER_ENV }}
-        run: |
-          set -euo pipefail
-
-          ENV_FILE="/home/$SSH_USERNAME/.9router/.env"
-
-          printf '%s\n' "$NINEROUTER_ENV" |
-            sudo tee "$ENV_FILE" >/dev/null
-
-          sudo chown \
-            "$SSH_USERNAME:$SSH_USERNAME" \
-            "$ENV_FILE"
-
-          sudo chmod 600 "$ENV_FILE"
-
-          echo "9Router environment restored."
-
-      # ==========================================================
-      # 12. Normalize and validate .env
-      # ==========================================================
-
-      - name: 12. Normalize And Validate 9Router Environment
-        env:
-          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-        run: |
-          set -euo pipefail
-
-          ENV_FILE="/home/$SSH_USERNAME/.9router/.env"
-          DATA_DIR="/home/$SSH_USERNAME/.9router"
-
-          sudo test -f "$ENV_FILE"
-
-          if ! sudo grep -Eq '^HOSTNAME=' "$ENV_FILE"; then
-            printf '%s\n' 'HOSTNAME=0.0.0.0' |
-              sudo tee -a "$ENV_FILE" >/dev/null
-          else
-            sudo sed -i \
-              's/^HOSTNAME=.*/HOSTNAME=0.0.0.0/' \
-              "$ENV_FILE"
-          fi
-
-          if ! sudo grep -Eq '^PORT=' "$ENV_FILE"; then
-            printf '%s\n' "PORT=$NINEROUTER_PORT" |
-              sudo tee -a "$ENV_FILE" >/dev/null
-          else
-            sudo sed -i \
-              "s/^PORT=.*/PORT=$NINEROUTER_PORT/" \
-              "$ENV_FILE"
-          fi
-
-          if ! sudo grep -Eq '^DATA_DIR=' "$ENV_FILE"; then
-            printf 'DATA_DIR=%s\n' "$DATA_DIR" |
-              sudo tee -a "$ENV_FILE" >/dev/null
-          else
-            sudo sed -i \
-              "s|^DATA_DIR=.*|DATA_DIR=$DATA_DIR|" \
-              "$ENV_FILE"
-          fi
-
-          if ! sudo grep -Eq '^JWT_SECRET=' "$ENV_FILE"; then
-            printf 'JWT_SECRET=%s\n' \
-              "$JWT_SECRET" |
-              sudo tee -a "$ENV_FILE" >/dev/null
-          fi
-
-          if ! sudo grep -Eq '^JWT_SECRET=.+$' "$ENV_FILE"; then
-            echo "ERROR: JWT_SECRET is empty."
-            exit 1
-          fi
-
-          sudo chown \
-            "$SSH_USERNAME:$SSH_USERNAME" \
-            "$ENV_FILE"
-
-          sudo chmod 600 "$ENV_FILE"
-
-          echo "9Router environment validated."
-
-      # ==========================================================
-      # 13. Install Node.js 24
-      # ==========================================================
-
-      - name: 13. Install Node.js 24
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-
-      # ==========================================================
-      # 14. Install exact 9Router
-      # ==========================================================
-
-      - name: 14. Install 9Router
-        env:
-          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
-        run: |
-          set -euo pipefail
-
-          sudo -u "$SSH_USERNAME" \
-            mkdir -p "/home/$SSH_USERNAME/.npm-global"
-
-          sudo chown -R \
-            "$SSH_USERNAME:$SSH_USERNAME" \
-            "/home/$SSH_USERNAME/.npm-global"
-
-          sudo -u "$SSH_USERNAME" \
-            npm config set prefix \
-              "/home/$SSH_USERNAME/.npm-global"
-
-          sudo -u "$SSH_USERNAME" \
-            npm install -g \
-              "9router@$NINEROUTER_VERSION"
-
-      # ==========================================================
-      # 15. Verify installation
-      # ==========================================================
-
-      - name: 15. Verify 9Router Installation
-        env:
-          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
-        run: |
-          set -euo pipefail
-
-          sudo -u "$SSH_USERNAME" \
-            "/home/$SSH_USERNAME/.npm-global/bin/9router" \
-            --version
-
-      # ==========================================================
-      # 16. Create systemd service
-      # ==========================================================
-
-      - name: 16. Create 9Router Systemd Service
-        env:
-          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
-        run: |
-          set -euo pipefail
-
-          sudo tee /etc/systemd/system/9router.service >/dev/null <<EOF
-          [Unit]
-          Description=9Router AI Gateway
-          After=network-online.target
-          Wants=network-online.target
-
-          [Service]
-          Type=simple
-          User=$SSH_USERNAME
-          Group=$SSH_USERNAME
-
-          WorkingDirectory=/home/$SSH_USERNAME/.9router
-
-          Environment=HOME=/home/$SSH_USERNAME
-          Environment=NODE_ENV=production
-          Environment=PORT=$NINEROUTER_PORT
-          Environment=DATA_DIR=/home/$SSH_USERNAME/.9router
-          Environment=PATH=/home/$SSH_USERNAME/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-          EnvironmentFile=/home/$SSH_USERNAME/.9router/.env
-
-          Environment=HOSTNAME=0.0.0.0
-
-          ExecStart=/home/$SSH_USERNAME/.npm-global/bin/9router --no-browser --skip-update
-
-          Restart=on-failure
-          RestartSec=5
-
-          NoNewPrivileges=true
-
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-
-          sudo systemctl daemon-reload
-          sudo systemctl enable 9router.service
-
-      # ==========================================================
-      # 17. Start 9Router
-      # ==========================================================
-
-      - name: 17. Start 9Router
-        run: |
-          set -euo pipefail
-
-          sudo systemctl restart 9router.service
-
-          sleep 5
-
-          sudo systemctl \
-            --no-pager \
-            --full \
-            status \
-            9router.service || true
-
-      # ==========================================================
-      # 18. Verify TCP bind
-      # ==========================================================
-
-      - name: 18. Verify 9Router TCP Bind
-        run: |
-          set -euo pipefail
-
-          for i in {1..30}; do
-            if sudo ss -lntp |
-              grep -q ":$NINEROUTER_PORT"; then
-
-              echo "9Router is listening on port $NINEROUTER_PORT."
-              exit 0
-            fi
-
-            sleep 2
-          done
-
-          echo "ERROR: 9Router did not bind to port $NINEROUTER_PORT."
-
-          sudo journalctl \
-            -u 9router.service \
-            --no-pager \
-            -n 100 || true
-
-          exit 1
 
       # ==========================================================
       # 19. REMOVE EXISTING MACHINE WITH EXACT HOSTNAME
@@ -879,30 +597,13 @@ jobs:
 
           echo "Telegram notification sent."
 
-      # ==========================================================
-      # OLLAMA STEPS
-      #
-      # Paste this whole block between step "21A. Telegram Online
-      # Notification" and step "22. Keep Runner Alive And Check Models".
-      #
-      # Required edits elsewhere in the workflow:
-      #   1) job: timeout-minutes: 350  ->  360
-      #   2) job env: add
-      #        OLLAMA_PORT: '11434'
-      #        OLLAMA_MODEL: 'qwen2.5-coder:14b'
-      #        OLLAMA_CONTEXT_LENGTH: '8192'
-      #   3) step 23: add   sudo systemctl stop ollama.service || true
-      #
-      # All Ollama steps use continue-on-error, so a problem here can
-      # never break 9Router, SSH, Tailscale or the self-restart chain.
-      # ==========================================================
-
+   
       # ==========================================================
       # 21B. Install Ollama and expose its port
       #
       # Ollama installs as a systemd service. A drop-in override makes
       # it listen on all interfaces (0.0.0.0) instead of 127.0.0.1, so
-      # it is reachable through the Tailscale IP, exactly like 9Router.
+      # it is reachable through the Tailscale IP
       # ==========================================================
 
       - name: 21B. Install Ollama And Expose Port
@@ -1112,7 +813,7 @@ jobs:
               "http://$TAILSCALE_IP:$OLLAMA_PORT/v1" \
             )"
           else
-            MESSAGE="⚠️ Ollama setup did not complete (status: $OLLAMA_OUTCOME). 9Router and SSH are not affected. Check the GitHub Actions log."
+            MESSAGE="⚠️ Ollama setup did not complete (status: $OLLAMA_OUTCOME). SSH are not affected. Check the GitHub Actions log."
           fi
 
           curl \
@@ -1140,8 +841,6 @@ jobs:
           NINEROUTER_MAX_MODELS_PER_CYCLE: ${{ env.NINEROUTER_MAX_MODELS_PER_CYCLE }}
         run: |
           set -euo pipefail
-
-          SCRIPT="/home/$SSH_USERNAME/9router-tests/check-and-sync.sh"
 
           END_TIME="$(
             date \
@@ -1172,18 +871,6 @@ jobs:
               sleep "$sleep_seconds"
             fi
           done
-
-      # ==========================================================
-      # 23. Stop 9Router
-      # ==========================================================
-
-      - name: 23. Stop 9Router
-        if: always()
-        run: |
-          set -euo pipefail
-
-          sudo systemctl stop 9router.service || true
-          sudo systemctl is-active 9router.service || true
 
       # ==========================================================
       # 24. Final Tailscale cleanup
@@ -1230,10 +917,6 @@ jobs:
           # owner/repo/.github/workflows/<file>@refs/heads/<branch>
           WORKFLOW_FILE="${GH_WORKFLOW_REF%@*}"
           WORKFLOW_FILE="${WORKFLOW_FILE##*/}"
-
-          echo "=================================================="
-          echo "Starting next 9Router runner"
-          echo "=================================================="
 
           echo "Repository:"
           echo "$GH_REPOSITORY"
@@ -1364,6 +1047,3 @@ jobs:
             echo "The next workflow should now start."
 
           fi
-
-          echo
-          echo "Next 9Router runner dispatch completed successfully."
