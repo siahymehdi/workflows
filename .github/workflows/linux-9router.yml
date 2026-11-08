@@ -221,6 +221,10 @@ jobs:
       # - .hostname is normally the short device hostname.
       # - Compare normalized short names, case-insensitively.
       # ==========================================================
+      
+      # ==========================================================
+      # 19. Remove any existing Tailscale device using this hostname
+      # ==========================================================
       - name: 19. Remove Existing Tailscale Machine
         env:
           TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
@@ -228,52 +232,120 @@ jobs:
         run: |
           set -euo pipefail
 
-          TARGET_HOSTNAME="$(printf '%s' "$TAILSCALE_HOSTNAME" |
-            tr '[:upper:]' '[:lower:]' |
-            cut -d '.' -f 1)"
+          TARGET_HOSTNAME="$(
+            printf '%s' "$TAILSCALE_HOSTNAME" |
+              tr '[:upper:]' '[:lower:]' |
+              cut -d '.' -f 1
+          )"
 
           echo "Target Tailscale hostname: $TARGET_HOSTNAME"
 
+          RESPONSE_FILE="$(mktemp)"
+          trap 'rm -f "$RESPONSE_FILE"' EXIT
+
+          # Make an authenticated Tailscale API request.
+          # HTTP errors are handled explicitly to provide useful diagnostics.
+          tailscale_api_request() {
+            local METHOD="$1"
+            local URL="$2"
+            local EXPECTED_STATUS="$3"
+            local HTTP_STATUS
+            local CURL_EXIT_CODE
+
+            : > "$RESPONSE_FILE"
+
+            set +e
+            HTTP_STATUS="$(
+              curl \
+                --silent \
+                --show-error \
+                --connect-timeout 10 \
+                --max-time 30 \
+                --user "${TAILSCALE_API_KEY}:" \
+                --request "$METHOD" \
+                --header "Accept: application/json" \
+                --output "$RESPONSE_FILE" \
+                --write-out "%{http_code}" \
+                "$URL"
+            )"
+            CURL_EXIT_CODE=$?
+            set -e
+
+            if [[ "$CURL_EXIT_CODE" -ne 0 ]]; then
+              echo "::error::Tailscale API connection failed (curl exit code: $CURL_EXIT_CODE)."
+              return 1
+            fi
+
+            case "$HTTP_STATUS" in
+              401)
+                echo "::error::Tailscale API authentication failed (HTTP 401)."
+                echo "::error::Check TAILSCALE_API_KEY in GitHub Secrets."
+                echo "::error::Use a valid Tailscale API Access Key, not a device Auth Key."
+                return 1
+                ;;
+
+              403)
+                echo "::error::Tailscale API permission denied (HTTP 403)."
+                echo "::error::The API key may lack permission to read or delete devices."
+                return 1
+                ;;
+
+              "$EXPECTED_STATUS")
+                return 0
+                ;;
+
+              *)
+                echo "::error::Unexpected Tailscale API response: HTTP $HTTP_STATUS."
+                echo "Response body:"
+                cat "$RESPONSE_FILE" || true
+                return 1
+                ;;
+            esac
+          }
+
           get_devices() {
-            curl --silent --show-error --fail-with-body \
-              --max-time 30 \
-              --user "${TAILSCALE_API_KEY}:" \
-              "https://api.tailscale.com/api/v2/tailnet/-/devices"
+            tailscale_api_request \
+              GET \
+              "https://api.tailscale.com/api/v2/tailnet/-/devices" \
+              200
+
+            cat "$RESPONSE_FILE"
+          }
+
+          find_matching_devices() {
+            jq -r --arg target "$TARGET_HOSTNAME" '
+              [
+                .devices[]
+                | select(
+                    (
+                      ((.hostname // "") | ascii_downcase | split(".")[0])
+                      == $target
+                    )
+                    or
+                    (
+                      ((.name // "") | ascii_downcase | split(".")[0])
+                      == $target
+                    )
+                  )
+                | .id
+                | select(type == "string" and length > 0)
+              ]
+              | unique
+              | .[]
+            '
           }
 
           echo "Retrieving current Tailscale devices..."
+
           DEVICES_JSON="$(get_devices)"
 
-          if ! echo "$DEVICES_JSON" | jq -e '.devices | type == "array"' >/dev/null; then
-            echo "::error::Tailscale API response does not contain a devices array."
-            echo "$DEVICES_JSON" | jq .
+          if ! jq -e '.devices | type == "array"' <<< "$DEVICES_JSON" >/dev/null; then
+            echo "::error::Tailscale API response does not contain a valid devices array."
             exit 1
           fi
 
-          # Match either hostname or name after removing the DNS suffix.
-          # The comparison is case-insensitive.
           MATCHING_DEVICE_IDS="$(
-            echo "$DEVICES_JSON" |
-              jq -r --arg target "$TARGET_HOSTNAME" '
-                [
-                  .devices[]
-                  | select(
-                      (
-                        ((.hostname // "") | ascii_downcase | split(".")[0])
-                        == $target
-                      )
-                      or
-                      (
-                        ((.name // "") | ascii_downcase | split(".")[0])
-                        == $target
-                      )
-                    )
-                  | .id
-                  | select(type == "string" and length > 0)
-                ]
-                | unique
-                | .[]
-              '
+            find_matching_devices <<< "$DEVICES_JSON"
           )"
 
           if [[ -z "$MATCHING_DEVICE_IDS" ]]; then
@@ -282,42 +354,31 @@ jobs:
             while IFS= read -r DEVICE_ID; do
               [[ -z "$DEVICE_ID" ]] && continue
 
-              echo "Deleting matching Tailscale device ID: $DEVICE_ID"
+              echo "Deleting matching Tailscale device..."
 
-              curl --silent --show-error --fail-with-body \
-                --max-time 30 \
-                --request DELETE \
-                --user "${TAILSCALE_API_KEY}:" \
-                "https://api.tailscale.com/api/v2/device/${DEVICE_ID}"
+              tailscale_api_request \
+                DELETE \
+                "https://api.tailscale.com/api/v2/device/${DEVICE_ID}" \
+                200
 
-              echo "Deletion request completed for $DEVICE_ID."
+              echo "Deletion request accepted."
             done <<< "$MATCHING_DEVICE_IDS"
           fi
 
-          echo "Waiting for Tailscale to release the hostname..."
+          echo "Verifying that the hostname has been released..."
 
           for attempt in $(seq 1 12); do
             VERIFY_JSON="$(get_devices)"
 
+            if ! jq -e '.devices | type == "array"' <<< "$VERIFY_JSON" >/dev/null; then
+              echo "::error::Invalid Tailscale API response during deletion verification."
+              exit 1
+            fi
+
             REMAINING="$(
-              echo "$VERIFY_JSON" |
-                jq --arg target "$TARGET_HOSTNAME" '
-                  [
-                    .devices[]
-                    | select(
-                        (
-                          ((.hostname // "") | ascii_downcase | split(".")[0])
-                          == $target
-                        )
-                        or
-                        (
-                          ((.name // "") | ascii_downcase | split(".")[0])
-                          == $target
-                        )
-                      )
-                  ]
-                  | length
-                '
+              find_matching_devices <<< "$VERIFY_JSON" |
+                wc -l |
+                tr -d ' '
             )"
 
             if [[ "$REMAINING" == "0" ]]; then
@@ -333,9 +394,9 @@ jobs:
           done
 
           echo "::error::Could not release hostname '$TARGET_HOSTNAME'."
-          echo "Check that TAILSCALE_API_KEY has permission to read and delete devices."
           exit 1
 
+      
       # ==========================================================
       # 20. Install and configure Tailscale Exit Node
       # ==========================================================
