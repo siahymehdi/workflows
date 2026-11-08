@@ -1,0 +1,845 @@
+name: Linux Vpn Server
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: vpn-qwen3-14b-server
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  # Tailscale
+  TAILSCALE_HOSTNAME: vpn-qwen3-14b
+
+  # SSH
+  SSH_PORT: '22'
+
+  # Ollama (Qwen 3.8 27B only)
+  OLLAMA_PORT: '11434'
+  OLLAMA_MODEL: 'qwen3:14b'
+  OLLAMA_MIN_VERSION: '0.32.12'
+  OLLAMA_CONTEXT_LENGTH: '8192'
+
+  # Keep the complete job below GitHub-hosted runner's maximum.
+  # Setup and model download time count toward timeout-minutes.
+  RUNNER_RUNTIME_MINUTES: '300'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      # ==========================================================
+      # 01. Checkout
+      # ==========================================================
+      - name: 01. Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ==========================================================
+      # 02. Validate required GitHub configuration
+      # ==========================================================
+      - name: 02. Validate Required GitHub Configuration
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required_vars=(
+            SSH_USERNAME
+            SSH_PASSWORD
+            TAILSCALE_AUTHKEY
+            TAILSCALE_API_KEY
+            TELEGRAM_BOT_TOKEN
+            TELEGRAM_CHAT_ID
+          )
+
+          for name in "${required_vars[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Required GitHub configuration is missing: $name"
+              exit 1
+            fi
+          done
+
+          echo "All required GitHub configuration is present."
+
+      # ==========================================================
+      # 02A. Update and upgrade Ubuntu (runs before anything else
+      #      is installed)
+      # ==========================================================
+      - name: 02A. Update And Upgrade Ubuntu
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export DEBIAN_FRONTEND=noninteractive
+          export NEEDRESTART_MODE=a
+
+          echo "Ubuntu release:"
+          lsb_release -ds || cat /etc/os-release
+
+          sudo -E apt-get update
+
+          sudo -E apt-get upgrade -y \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold"
+
+          sudo -E apt-get autoremove -y
+          sudo -E apt-get clean
+
+          echo "Ubuntu update and upgrade completed."
+
+      # ==========================================================
+      # 03. Install packages
+      # ==========================================================
+      - name: 03. Install Required Packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export DEBIAN_FRONTEND=noninteractive
+          export NEEDRESTART_MODE=a
+
+          sudo -E apt-get update
+          sudo -E apt-get install -y \
+            curl \
+            wget \
+            jq \
+            git \
+            openssh-server \
+            sqlite3 \
+            ca-certificates \
+            gnupg \
+            lsof \
+            net-tools \
+            unzip \
+            ethtool \
+            zstd
+
+      # ==========================================================
+      # 04. Install GitHub CLI
+      # ==========================================================
+      - name: 04. Install GitHub CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v gh >/dev/null 2>&1; then
+            curl -fsSL \
+              https://cli.github.com/packages/githubcli-archive-keyring.gpg |
+              sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+
+            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+
+            echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" |
+              sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+
+          gh --version
+
+      # ==========================================================
+      # 05. Configure Git
+      # ==========================================================
+      - name: 05. Configure Git
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global pull.rebase false
+          git config --global init.defaultBranch main
+
+      # ==========================================================
+      # 06. Create SSH administrator
+      # ==========================================================
+      - name: 06. Setup SSH User And Administrator Access
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! id "$SSH_USERNAME" >/dev/null 2>&1; then
+            sudo useradd --create-home --shell /bin/bash "$SSH_USERNAME"
+          fi
+
+          echo "$SSH_USERNAME:$SSH_PASSWORD" | sudo chpasswd
+          sudo usermod --append --groups sudo "$SSH_USERNAME"
+
+          sudo tee "/etc/sudoers.d/$SSH_USERNAME" >/dev/null <<EOF
+          $SSH_USERNAME ALL=(ALL:ALL) NOPASSWD:ALL
+          EOF
+
+          sudo chmod 0440 "/etc/sudoers.d/$SSH_USERNAME"
+          sudo visudo -cf "/etc/sudoers.d/$SSH_USERNAME"
+
+          sudo id "$SSH_USERNAME"
+          sudo -u "$SSH_USERNAME" id
+
+      # ==========================================================
+      # 07. Configure SSH
+      # ==========================================================
+      - name: 07. Setup SSH Server
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo sed -i -E \
+            's/^#?PasswordAuthentication .*/PasswordAuthentication yes/' \
+            /etc/ssh/sshd_config
+
+          sudo sed -i -E \
+            's/^#?PubkeyAuthentication .*/PubkeyAuthentication yes/' \
+            /etc/ssh/sshd_config
+
+          sudo sed -i -E \
+            's/^#?PermitRootLogin .*/PermitRootLogin no/' \
+            /etc/ssh/sshd_config
+
+          sudo sshd -t
+          sudo systemctl enable ssh
+          sudo systemctl restart ssh
+
+          echo "SSH configured for $SSH_USERNAME."
+
+      # ==========================================================
+      # 08. Enable IP forwarding
+      # ==========================================================
+      - name: 08. Configure IP Forwarding
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo tee /etc/sysctl.d/99-tailscale-forwarding.conf >/dev/null <<'EOF'
+          net.ipv4.ip_forward = 1
+          net.ipv6.conf.all.forwarding = 1
+          EOF
+
+          sudo sysctl --system
+
+          test "$(sysctl -n net.ipv4.ip_forward)" = "1"
+          test "$(sysctl -n net.ipv6.conf.all.forwarding)" = "1"
+
+          echo "IP forwarding is enabled."
+
+      # ==========================================================
+      # 19. Remove any existing Tailscale device using this hostname
+      #
+      # Important:
+      # - Tailscale may return a lowercase hostname.
+      # - .name can be a fully qualified DNS name.
+      # - .hostname is normally the short device hostname.
+      # - Compare normalized short names, case-insensitively.
+      # ==========================================================
+      - name: 19. Remove Existing Tailscale Machine
+        env:
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_HOSTNAME="$(
+            printf '%s' "$TAILSCALE_HOSTNAME" |
+              tr '[:upper:]' '[:lower:]' |
+              cut -d '.' -f 1
+          )"
+
+          echo "Target Tailscale hostname: $TARGET_HOSTNAME"
+
+          RESPONSE_FILE="$(mktemp)"
+          trap 'rm -f "$RESPONSE_FILE"' EXIT
+
+          # Make an authenticated Tailscale API request.
+          # HTTP errors are handled explicitly to provide useful diagnostics.
+          tailscale_api_request() {
+            local METHOD="$1"
+            local URL="$2"
+            local EXPECTED_STATUS="$3"
+            local HTTP_STATUS
+            local CURL_EXIT_CODE
+
+            : > "$RESPONSE_FILE"
+
+            set +e
+            HTTP_STATUS="$(
+              curl \
+                --silent \
+                --show-error \
+                --connect-timeout 10 \
+                --max-time 30 \
+                --user "${TAILSCALE_API_KEY}:" \
+                --request "$METHOD" \
+                --header "Accept: application/json" \
+                --output "$RESPONSE_FILE" \
+                --write-out "%{http_code}" \
+                "$URL"
+            )"
+            CURL_EXIT_CODE=$?
+            set -e
+
+            if [[ "$CURL_EXIT_CODE" -ne 0 ]]; then
+              echo "::error::Tailscale API connection failed (curl exit code: $CURL_EXIT_CODE)."
+              return 1
+            fi
+
+            case "$HTTP_STATUS" in
+              401)
+                echo "::error::Tailscale API authentication failed (HTTP 401)."
+                echo "::error::Check TAILSCALE_API_KEY in GitHub Secrets."
+                echo "::error::Use a valid Tailscale API Access Key, not a device Auth Key."
+                return 1
+                ;;
+
+              403)
+                echo "::error::Tailscale API permission denied (HTTP 403)."
+                echo "::error::The API key may lack permission to read or delete devices."
+                return 1
+                ;;
+
+              "$EXPECTED_STATUS")
+                return 0
+                ;;
+
+              *)
+                echo "::error::Unexpected Tailscale API response: HTTP $HTTP_STATUS."
+                echo "Response body:"
+                cat "$RESPONSE_FILE" || true
+                return 1
+                ;;
+            esac
+          }
+
+          get_devices() {
+            tailscale_api_request \
+              GET \
+              "https://api.tailscale.com/api/v2/tailnet/-/devices" \
+              200
+
+            cat "$RESPONSE_FILE"
+          }
+
+          find_matching_devices() {
+            jq -r --arg target "$TARGET_HOSTNAME" '
+              [
+                .devices[]
+                | select(
+                    (
+                      ((.hostname // "") | ascii_downcase | split(".")[0])
+                      == $target
+                    )
+                    or
+                    (
+                      ((.name // "") | ascii_downcase | split(".")[0])
+                      == $target
+                    )
+                  )
+                | .id
+                | select(type == "string" and length > 0)
+              ]
+              | unique
+              | .[]
+            '
+          }
+
+          echo "Retrieving current Tailscale devices..."
+
+          DEVICES_JSON="$(get_devices)"
+
+          if ! jq -e '.devices | type == "array"' <<< "$DEVICES_JSON" >/dev/null; then
+            echo "::error::Tailscale API response does not contain a valid devices array."
+            exit 1
+          fi
+
+          MATCHING_DEVICE_IDS="$(
+            find_matching_devices <<< "$DEVICES_JSON"
+          )"
+
+          if [[ -z "$MATCHING_DEVICE_IDS" ]]; then
+            echo "No existing device matches '$TARGET_HOSTNAME'."
+          else
+            while IFS= read -r DEVICE_ID; do
+              [[ -z "$DEVICE_ID" ]] && continue
+
+              echo "Deleting matching Tailscale device..."
+
+              tailscale_api_request \
+                DELETE \
+                "https://api.tailscale.com/api/v2/device/${DEVICE_ID}" \
+                200
+
+              echo "Deletion request accepted."
+            done <<< "$MATCHING_DEVICE_IDS"
+          fi
+
+          echo "Verifying that the hostname has been released..."
+
+          for attempt in $(seq 1 12); do
+            VERIFY_JSON="$(get_devices)"
+
+            if ! jq -e '.devices | type == "array"' <<< "$VERIFY_JSON" >/dev/null; then
+              echo "::error::Invalid Tailscale API response during deletion verification."
+              exit 1
+            fi
+
+            REMAINING="$(
+              find_matching_devices <<< "$VERIFY_JSON" |
+                wc -l |
+                tr -d ' '
+            )"
+
+            if [[ "$REMAINING" == "0" ]]; then
+              echo "Hostname '$TARGET_HOSTNAME' is available."
+              exit 0
+            fi
+
+            echo "Attempt $attempt/12: $REMAINING matching device(s) remain."
+
+            if [[ "$attempt" -lt 12 ]]; then
+              sleep 5
+            fi
+          done
+
+          echo "::error::Could not release hostname '$TARGET_HOSTNAME'."
+          exit 1
+
+      # ==========================================================
+      # 20. Install and configure Tailscale Exit Node
+      # ==========================================================
+      - name: 20. Setup Tailscale Exit Node
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+          sudo systemctl enable --now tailscaled
+
+          sudo tailscale up \
+            --authkey="$TAILSCALE_AUTHKEY" \
+            --hostname="$TAILSCALE_HOSTNAME" \
+            --advertise-exit-node
+
+          sudo tailscale set --operator="$SSH_USERNAME"
+
+          test "$(sysctl -n net.ipv4.ip_forward)" = "1"
+          test "$(sysctl -n net.ipv6.conf.all.forwarding)" = "1"
+
+          echo "Tailscale status:"
+          sudo tailscale status
+
+          echo "Tailscale IP:"
+          sudo tailscale ip
+
+      # ==========================================================
+      # 21. Verify SSH administrator
+      # ==========================================================
+      - name: 21. Verify SSH User Administrator Access
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo -u "$SSH_USERNAME" sudo -n true
+          sudo -u "$SSH_USERNAME" sudo -n id
+          echo "SSH administrator verification passed."
+
+      # ==========================================================
+      # 21A. Telegram online notification
+      # ==========================================================
+      - name: 21A. Telegram Online Notification
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1)"
+          test -n "$TAILSCALE_IP"
+
+          ACTUAL_HOSTNAME="$(
+            sudo tailscale status --self --json |
+              jq -r '.Self.DNSName // .Self.HostName // "Not detected"'
+          )"
+
+          MESSAGE="$(cat <<EOF
+          🚀 $ACTUAL_HOSTNAME is ONLINE
+          ━━━━━━━━━━━━━━━━━━━━
+          Hostname: $ACTUAL_HOSTNAME
+          Tailscale IP: $TAILSCALE_IP
+
+          SSH:
+          ssh $SSH_USERNAME@$TAILSCALE_IP
+          Port: $SSH_PORT
+
+          Runtime: approximately $RUNNER_RUNTIME_MINUTES minutes
+          EOF
+          )"
+
+          RESPONSE="$(
+            curl --silent --show-error --fail \
+              --max-time 20 \
+              --request POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${MESSAGE}"
+          )"
+
+          echo "$RESPONSE" | jq -e '.ok == true' >/dev/null
+          echo "Telegram online notification sent."
+
+      # ==========================================================
+      # 21B. Make sure Ollama is installed (and new enough for
+      #      Qwen 3.8), then expose its API over Tailscale
+      # ==========================================================
+      - name: 21B. Ensure Ollama Is Installed And Expose Port
+        id: ollama_install
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Runner resources:"
+          free -h
+          df -h /
+
+          TOTAL_RAM_MB="$(free -m | awk '/^Mem:/ {print $2}')"
+          if [[ "$TOTAL_RAM_MB" -lt 24000 ]]; then
+            echo "::warning::Runner has ${TOTAL_RAM_MB} MB RAM; $OLLAMA_MODEL (~18 GB) will not fit fully in memory and may be very slow or fail."
+          fi
+
+          AVAILABLE_GB="$(df --output=avail -BG / | tail -n 1 | tr -dc '0-9')"
+          if [[ "$AVAILABLE_GB" -lt 30 ]]; then
+            echo "Removing selected preinstalled toolchains to free disk space..."
+            sudo rm -rf \
+              /usr/share/dotnet \
+              /opt/ghc \
+              /usr/local/lib/android \
+              /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
+
+          # Install Ollama if missing. The install script always fetches
+          # the latest release, so re-running it also upgrades an
+          # outdated install.
+          ollama_version() {
+            ollama --version 2>/dev/null |
+              grep -oE '[0-9]+\.[0-9]+\.[0-9]+' |
+              head -n 1
+          }
+
+          version_ge() {
+            [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" == "$2" ]]
+          }
+
+          INSTALLED_VERSION=""
+          if command -v ollama >/dev/null 2>&1; then
+            INSTALLED_VERSION="$(ollama_version || true)"
+            echo "Ollama already installed: ${INSTALLED_VERSION:-unknown}"
+          else
+            echo "Ollama is not installed."
+          fi
+
+          if [[ -z "$INSTALLED_VERSION" ]] ||
+             ! version_ge "$INSTALLED_VERSION" "$OLLAMA_MIN_VERSION"; then
+            echo "Installing/upgrading Ollama..."
+            curl -fsSL https://ollama.com/install.sh | sh
+          fi
+
+          command -v ollama >/dev/null 2>&1 || {
+            echo "::error::Ollama installation failed."
+            exit 1
+          }
+
+          FINAL_VERSION="$(ollama_version || true)"
+          echo "Ollama version: ${FINAL_VERSION:-unknown}"
+
+          if [[ -z "$FINAL_VERSION" ]] ||
+             ! version_ge "$FINAL_VERSION" "$OLLAMA_MIN_VERSION"; then
+            echo "::error::Ollama $FINAL_VERSION is older than required $OLLAMA_MIN_VERSION for $OLLAMA_MODEL."
+            exit 1
+          fi
+
+          sudo mkdir -p /etc/systemd/system/ollama.service.d
+
+          sudo tee /etc/systemd/system/ollama.service.d/override.conf >/dev/null <<EOF
+          [Service]
+          Environment="OLLAMA_HOST=0.0.0.0:$OLLAMA_PORT"
+          Environment="OLLAMA_KEEP_ALIVE=-1"
+          Environment="OLLAMA_CONTEXT_LENGTH=$OLLAMA_CONTEXT_LENGTH"
+          Environment="OLLAMA_MAX_LOADED_MODELS=1"
+          EOF
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable ollama.service
+          sudo systemctl restart ollama.service
+
+          # Ollama has no built-in API authentication. Permit access to
+          # its port only through Tailscale (and localhost), not other
+          # runner network interfaces.
+          sudo iptables -C INPUT ! -i tailscale0 ! -i lo -p tcp --dport "$OLLAMA_PORT" -j DROP 2>/dev/null ||
+            sudo iptables -I INPUT 1 ! -i tailscale0 ! -i lo -p tcp --dport "$OLLAMA_PORT" -j DROP
+
+          if command -v ip6tables >/dev/null 2>&1; then
+            sudo ip6tables -C INPUT ! -i tailscale0 ! -i lo -p tcp --dport "$OLLAMA_PORT" -j DROP 2>/dev/null ||
+              sudo ip6tables -I INPUT 1 ! -i tailscale0 ! -i lo -p tcp --dport "$OLLAMA_PORT" -j DROP
+          fi
+
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 5 \
+              "http://127.0.0.1:$OLLAMA_PORT/api/version" >/dev/null; then
+              break
+            fi
+
+            if [[ "$i" -eq 30 ]]; then
+              sudo journalctl -u ollama.service --no-pager -n 100 || true
+              echo "::error::Ollama API did not start."
+              exit 1
+            fi
+            sleep 2
+          done
+
+          if ! sudo ss -lnt | grep -E "(0\\.0\\.0\\.0|\\*|\\[::\\]):$OLLAMA_PORT"; then
+            echo "::error::Ollama is not listening on all interfaces."
+            exit 1
+          fi
+
+          echo "Ollama is installed and running."
+
+      # ==========================================================
+      # 21C. Pull Qwen 3.8 27B (the only model)
+      # ==========================================================
+      - name: 21C. Pull Qwen 3.8 27B
+        id: ollama_pull
+        if: steps.ollama_install.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          export OLLAMA_HOST="127.0.0.1:$OLLAMA_PORT"
+
+          for attempt in 1 2 3; do
+            echo "Pulling $OLLAMA_MODEL (attempt $attempt/3)..."
+
+            if ollama pull "$OLLAMA_MODEL"; then
+              break
+            fi
+
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "::error::Failed to pull $OLLAMA_MODEL."
+              exit 1
+            fi
+
+            sleep 15
+          done
+
+          # Keep only the requested model: remove anything else.
+          ollama list |
+            awk 'NR>1 {print $1}' |
+            grep -vxF "$OLLAMA_MODEL" |
+            xargs -r -n1 ollama rm || true
+
+          echo "Installed models:"
+          ollama list
+          df -h /
+
+      # ==========================================================
+      # 21D. Load model and verify API
+      # ==========================================================
+      - name: 21D. Load Model And Verify Ollama API
+        id: ollama_verify
+        if: steps.ollama_pull.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Qwen 3.8 is a thinking model; think:false keeps this
+          # smoke test short. Loading a 27B model on CPU can take
+          # several minutes, hence the generous timeout.
+          RESPONSE="$(
+            curl -fsS \
+              --max-time 1500 \
+              "http://127.0.0.1:$OLLAMA_PORT/api/generate" \
+              -H "Content-Type: application/json" \
+              -d "$(
+                jq -n \
+                  --arg model "$OLLAMA_MODEL" \
+                  '{
+                    model: $model,
+                    prompt: "Reply with the single word: ready",
+                    stream: false,
+                    think: false,
+                    keep_alive: -1,
+                    options: { num_predict: 8 }
+                  }'
+              )"
+          )"
+
+          echo "$RESPONSE" | jq -r '"Model reply: \(.response)"'
+
+          echo "Loaded models:"
+          curl -fsS "http://127.0.0.1:$OLLAMA_PORT/api/ps" |
+            jq -r '.models[].name'
+
+          TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1)"
+          if curl -fsS --max-time 10 \
+            "http://$TAILSCALE_IP:$OLLAMA_PORT/api/tags" >/dev/null; then
+            echo "Ollama is reachable through Tailscale: http://$TAILSCALE_IP:$OLLAMA_PORT"
+          else
+            echo "::warning::Ollama did not answer on the Tailscale IP."
+          fi
+
+      # ==========================================================
+      # 21E. Telegram Ollama notification
+      # ==========================================================
+      - name: 21E. Telegram Ollama Notification
+        if: always()
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OLLAMA_OUTCOME: ${{ steps.ollama_verify.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1 || true)"
+
+          if [[ "$OLLAMA_OUTCOME" == "success" ]]; then
+            MESSAGE="$(printf '%s\n' \
+              '🦙 Ollama is READY' \
+              "Model: $OLLAMA_MODEL" \
+              "API: http://$TAILSCALE_IP:$OLLAMA_PORT" \
+              "OpenAI-compatible endpoint: http://$TAILSCALE_IP:$OLLAMA_PORT/v1")"
+          else
+            MESSAGE="⚠️ Ollama setup did not complete (status: ${OLLAMA_OUTCOME:-unknown}). SSH may still be available. Check GitHub Actions logs."
+          fi
+
+          curl --silent --show-error --fail \
+            --max-time 20 \
+            --request POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}" >/dev/null
+
+      # ==========================================================
+      # 22. Keep runner alive
+      # Note: this is a keep-alive wait, not a model-check loop.
+      # ==========================================================
+      - name: 22. Keep Runner Alive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          END_TIME="$(date -u -d "+${RUNNER_RUNTIME_MINUTES} minutes" +%s)"
+          echo "Keeping runner alive for up to ${RUNNER_RUNTIME_MINUTES} minutes."
+
+          while true; do
+            NOW="$(date -u +%s)"
+            REMAINING=$((END_TIME - NOW))
+
+            if [[ "$REMAINING" -le 0 ]]; then
+              echo "Runtime window completed."
+              break
+            fi
+
+            sleep_seconds=60
+            if [[ "$sleep_seconds" -gt "$REMAINING" ]]; then
+              sleep_seconds="$REMAINING"
+            fi
+
+            sleep "$sleep_seconds"
+          done
+
+      # ==========================================================
+      # 24. Tailscale cleanup
+      # ==========================================================
+      - name: 24. Tailscale Down
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo tailscale down || true
+          echo "Tailscale is down."
+
+      # ==========================================================
+      # 25. Dispatch the next workflow run
+      # ==========================================================
+      - name: 25. Start Next Workflow Run
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_REF: ${{ github.ref_name }}
+          GH_WORKFLOW_REF: ${{ github.workflow_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORKFLOW_FILE="${GH_WORKFLOW_REF%@*}"
+          WORKFLOW_FILE="${WORKFLOW_FILE##*/}"
+
+          echo "Repository: $GH_REPOSITORY"
+          echo "Branch: $GH_REF"
+          echo "Workflow file: $WORKFLOW_FILE"
+
+          curl --silent --show-error --fail-with-body \
+            --request GET \
+            --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}" \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --output /tmp/workflow-info.json
+
+          jq -r '"Workflow: \(.name)\nPath: \(.path)\nState: \(.state)"' \
+            /tmp/workflow-info.json
+
+          HTTP_STATUS="$(
+            curl --silent --show-error \
+              --output /tmp/workflow-dispatch-response.txt \
+              --dump-header /tmp/workflow-dispatch-headers.txt \
+              --write-out "%{http_code}" \
+              --request POST \
+              --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/dispatches" \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              --header "Content-Type: application/json" \
+              --data "$(jq -n --arg ref "$GH_REF" '{ref: $ref}')"
+          )"
+
+          echo "Dispatch HTTP status: $HTTP_STATUS"
+
+          if [[ "$HTTP_STATUS" != "204" && "$HTTP_STATUS" != "200" ]]; then
+            echo "::error::Workflow dispatch failed with HTTP $HTTP_STATUS."
+            cat /tmp/workflow-dispatch-response.txt || true
+            exit 1
+          fi
+
+          echo "Next workflow dispatch request was accepted."
