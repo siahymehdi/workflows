@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: vpn-qwen2_5-14b-server
+  group: vpn-qwen2-5-14b-server
   cancel-in-progress: false
 
 permissions:
@@ -13,7 +13,7 @@ permissions:
 
 env:
   # Tailscale
-  TAILSCALE_HOSTNAME: vpn-qwen2_5-14b
+  TAILSCALE_HOSTNAME: vpn-qwen2-5-14b
 
   # SSH
   SSH_PORT: '22'
