@@ -1,4 +1,4 @@
-name: Linux Vpn Server
+name: Linux vpn-qwen3-14b
 
 on:
   workflow_dispatch:
