@@ -436,22 +436,54 @@ jobs:
           curl -fsSL https://tailscale.com/install.sh | sh
 
           sudo systemctl enable --now tailscaled
-
+          
           sudo tailscale up \
             --authkey="$TAILSCALE_AUTHKEY" \
             --hostname="$TAILSCALE_HOSTNAME" \
             --advertise-exit-node
-
+          
           sudo tailscale set --operator="$SSH_USERNAME"
-
+          
           test "$(sysctl -n net.ipv4.ip_forward)" = "1"
           test "$(sysctl -n net.ipv6.conf.all.forwarding)" = "1"
-
+          
           echo "Tailscale status:"
           sudo tailscale status
-
+          
+          echo "Verifying exit-node advertisement and approval..."
+          
+          STATUS_JSON="$(sudo tailscale status --json)"
+          
+          echo "$STATUS_JSON" | jq '.Self | {
+            HostName,
+            TailscaleIPs,
+            Tags,
+            PrimaryRoutes,
+            ExitNodeOption
+          }'
+          
+          # Ensure the expected tag is assigned.
+          if ! jq -e '
+            (.Self.Tags // []) | index("tag:exitnodes") != null
+          ' <<< "$STATUS_JSON" >/dev/null; then
+            echo "::error::tag:exitnodes is missing from this machine."
+            echo "::error::Check the GitHub TAILSCALE_AUTHKEY configuration."
+            exit 1
+          fi
+          
+          # ExitNodeOption means the machine advertises and has approval.
+          if ! jq -e '.Self.ExitNodeOption == true' \
+            <<< "$STATUS_JSON" >/dev/null; then
+            echo "::error::The exit-node advertisement is not approved."
+            echo "::error::Check autoApprovers.exitNode in Tailscale policy."
+            exit 1
+          fi
+          
+          echo "Exit-node advertisement and approval verified."
+          
           echo "Tailscale IP:"
           sudo tailscale ip
+
 
       # ==========================================================
       # 21. Verify SSH administrator
