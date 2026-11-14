@@ -1,0 +1,800 @@
+name: Linux VPN + Ollama (16 GB RAM)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ollama_model:
+        description: Local model to install (Qwen3.5 9B is recommended for 16 GB RAM)
+        required: true
+        type: choice
+        default: qwen3.5:9b
+        options:
+          - qwen3.5:9b
+          - qwen2.5-coder:14b
+          - qwen3:8b
+          - gemma3:12b
+          - phi4:14b
+          - qwen2.5-coder:7b
+      keep_runner_minutes:
+        description: How long to keep this runner online
+        required: true
+        type: choice
+        default: '300'
+        options:
+          - '60'
+          - '120'
+          - '180'
+          - '240'
+          - '300'
+
+# One active VPN runner per repository. A new dispatch waits rather than
+# terminating the currently connected runner.
+concurrency:
+  group: linux-vpn-ollama-runner
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  TAILSCALE_HOSTNAME: vpn-ollama-16gb
+  SSH_PORT: '22'
+  OLLAMA_PORT: '11434'
+  OLLAMA_MODEL: ${{ inputs.ollama_model || 'qwen3.5:9b' }}
+  OLLAMA_MIN_VERSION: '0.34.0'
+  OLLAMA_CONTEXT_LENGTH: '8192'
+  OLLAMA_MIN_AVAILABLE_RAM_GB: '11'
+  OLLAMA_MIN_FREE_DISK_GB: '12'
+  RUNNER_RUNTIME_MINUTES: ${{ inputs.keep_runner_minutes || '300' }}
+
+jobs:
+  build:
+    # Pin the Ubuntu image so changes to ubuntu-latest do not unexpectedly
+    # alter the base operating system during a long-running workflow.
+    runs-on: ubuntu-24.04
+    # GitHub-hosted jobs have a six-hour maximum. 300 minutes are reserved
+    # for the online period; the remaining time is for setup and teardown.
+    timeout-minutes: 350
+
+    steps:
+      # ================================================================
+      # 01. Validate configuration before making system changes
+      # ================================================================
+      - name: 01. Validate Required GitHub Configuration
+        id: validate_config
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required_vars=(
+            SSH_USERNAME
+            SSH_PASSWORD
+            TAILSCALE_AUTHKEY
+            TAILSCALE_API_KEY
+            TELEGRAM_BOT_TOKEN
+            TELEGRAM_CHAT_ID
+          )
+
+          for name in "${required_vars[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Required GitHub configuration is missing: $name"
+              exit 1
+            fi
+          done
+
+          if [[ ! "$SSH_USERNAME" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*[$]?$ ]]; then
+            echo "::error::SSH_USERNAME is not a valid Linux account name."
+            exit 1
+          fi
+
+          if [[ ! "$RUNNER_RUNTIME_MINUTES" =~ ^(60|120|180|240|300)$ ]]; then
+            echo "::error::Unsupported runner runtime: $RUNNER_RUNTIME_MINUTES"
+            exit 1
+          fi
+
+          echo "Configuration is present."
+          echo "Selected model: $OLLAMA_MODEL"
+          echo "Runner online period: $RUNNER_RUNTIME_MINUTES minutes"
+
+      # ================================================================
+      # 02. Install only the packages this workflow actually uses
+      # ================================================================
+      - name: 02. Install Required Packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          echo "Runner operating system:"
+          cat /etc/os-release
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates \
+            curl \
+            iptables \
+            jq
+
+          sudo apt-get clean
+          echo "Installed required packages."
+          free -h
+          df -h /
+
+      # ================================================================
+      # 03. Create the SSH administrator
+      # ================================================================
+      - name: 03. Configure SSH Administrator
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! id "$SSH_USERNAME" >/dev/null 2>&1; then
+            sudo useradd --create-home --shell /bin/bash "$SSH_USERNAME"
+          fi
+
+          printf '%s:%s\n' "$SSH_USERNAME" "$SSH_PASSWORD" | sudo chpasswd
+          sudo usermod --append --groups sudo "$SSH_USERNAME"
+
+          sudo tee "/etc/sudoers.d/$SSH_USERNAME" >/dev/null <<EOF
+          $SSH_USERNAME ALL=(ALL:ALL) NOPASSWD:ALL
+          EOF
+          sudo chmod 0440 "/etc/sudoers.d/$SSH_USERNAME"
+          sudo visudo --check --file="/etc/sudoers.d/$SSH_USERNAME"
+
+          sudo id "$SSH_USERNAME"
+          sudo -u "$SSH_USERNAME" sudo -n true
+
+      # ================================================================
+      # 04. Enable forwarding for the Tailscale exit node
+      # ================================================================
+      - name: 04. Enable IP Forwarding
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo tee /etc/sysctl.d/99-tailscale-forwarding.conf >/dev/null <<'EOF'
+          net.ipv4.ip_forward = 1
+          net.ipv6.conf.all.forwarding = 1
+          EOF
+
+          sudo sysctl --system
+          test "$(sysctl -n net.ipv4.ip_forward)" = "1"
+          test "$(sysctl -n net.ipv6.conf.all.forwarding)" = "1"
+
+      # ================================================================
+      # 05. Install Tailscale
+      # ================================================================
+      - name: 05. Install Tailscale
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled
+          tailscale version
+
+      # ================================================================
+      # 06. Remove a stale device with the same hostname
+      # ================================================================
+      - name: 06. Remove Existing Tailscale Device
+        env:
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_HOSTNAME="$(printf '%s' "$TAILSCALE_HOSTNAME" | tr '[:upper:]' '[:lower:]' | cut -d '.' -f 1)"
+          RESPONSE_FILE="$(mktemp)"
+          trap 'rm -f "$RESPONSE_FILE"' EXIT
+
+          tailscale_api_request() {
+            local method="$1"
+            local url="$2"
+            local expected_status="$3"
+            local http_status
+
+            if ! http_status="$(curl --silent --show-error \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --user "${TAILSCALE_API_KEY}:" \
+              --request "$method" \
+              --header 'Accept: application/json' \
+              --output "$RESPONSE_FILE" \
+              --write-out '%{http_code}' \
+              "$url")"; then
+              echo "::error::Could not connect to the Tailscale API."
+              return 1
+            fi
+
+            case "$http_status" in
+              401)
+                echo "::error::Tailscale API authentication failed (HTTP 401)."
+                echo "::error::Use a Tailscale API access key, not a device auth key."
+                return 1
+                ;;
+              403)
+                echo "::error::Tailscale API permission denied (HTTP 403)."
+                echo "::error::The API key needs device-list and device-delete permissions."
+                return 1
+                ;;
+              200)
+                if [[ "$expected_status" == '200' || "$expected_status" == '200-or-204' ]]; then
+                  return 0
+                fi
+                echo "::error::Unexpected Tailscale API status: HTTP $http_status."
+                cat "$RESPONSE_FILE" || true
+                return 1
+                ;;
+              204)
+                if [[ "$expected_status" == '200-or-204' ]]; then
+                  return 0
+                fi
+                echo "::error::Unexpected Tailscale API status: HTTP $http_status."
+                cat "$RESPONSE_FILE" || true
+                return 1
+                ;;
+              *)
+                echo "::error::Unexpected Tailscale API status: HTTP $http_status."
+                cat "$RESPONSE_FILE" || true
+                return 1
+                ;;
+            esac
+          }
+
+          get_devices() {
+            tailscale_api_request GET \
+              'https://api.tailscale.com/api/v2/tailnet/-/devices' 200
+            cat "$RESPONSE_FILE"
+          }
+
+          find_matching_devices() {
+            jq -r --arg target "$TARGET_HOSTNAME" '
+              [
+                (.devices // [])[]
+                | select(
+                    (((.hostname // "") | ascii_downcase | split(".")[0]) == $target)
+                    or
+                    (((.name // "") | ascii_downcase | split(".")[0]) == $target)
+                  )
+                | .id
+                | select(type == "string" and length > 0)
+              ]
+              | unique
+              | .[]
+            '
+          }
+
+          echo "Looking for an existing Tailscale device named $TARGET_HOSTNAME..."
+          DEVICES_JSON="$(get_devices)"
+          jq -e '.devices | type == "array"' <<< "$DEVICES_JSON" >/dev/null
+          MATCHING_DEVICE_IDS="$(find_matching_devices <<< "$DEVICES_JSON")"
+
+          if [[ -z "$MATCHING_DEVICE_IDS" ]]; then
+            echo "No stale device found."
+          else
+            while IFS= read -r DEVICE_ID; do
+              [[ -z "$DEVICE_ID" ]] && continue
+              echo "Deleting stale device ID: $DEVICE_ID"
+              tailscale_api_request DELETE \
+                "https://api.tailscale.com/api/v2/device/${DEVICE_ID}" '200-or-204'
+            done <<< "$MATCHING_DEVICE_IDS"
+
+            echo "Verifying that the old hostname has been released..."
+            for attempt in $(seq 1 12); do
+              VERIFY_JSON="$(get_devices)"
+              jq -e '.devices | type == "array"' <<< "$VERIFY_JSON" >/dev/null
+              REMAINING="$(find_matching_devices <<< "$VERIFY_JSON" | wc -l | tr -d ' ')"
+
+              if [[ "$REMAINING" == '0' ]]; then
+                echo "Hostname is available."
+                exit 0
+              fi
+
+              echo "Attempt $attempt/12: $REMAINING matching device(s) remain."
+              [[ "$attempt" -eq 12 ]] || sleep 5
+            done
+
+            echo "::error::Could not release Tailscale hostname $TARGET_HOSTNAME."
+            exit 1
+          fi
+
+      # ================================================================
+      # 07. Connect this runner as a Tailscale exit node
+      # ================================================================
+      - name: 07. Start Tailscale Exit Node
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo tailscale up \
+            --authkey="$TAILSCALE_AUTHKEY" \
+            --hostname="$TAILSCALE_HOSTNAME" \
+            --advertise-exit-node
+
+          sudo tailscale set --operator="$SSH_USERNAME"
+
+          STATUS_JSON="$(sudo tailscale status --json)"
+          echo "$STATUS_JSON" | jq '.Self | {
+            HostName,
+            DNSName,
+            TailscaleIPs,
+            Tags,
+            PrimaryRoutes,
+            ExitNodeOption
+          }'
+
+          if ! jq -e '(.Self.Tags // []) | index("tag:exitnodes") != null' <<< "$STATUS_JSON" >/dev/null; then
+            echo "::error::tag:exitnodes is missing. Check the Tailscale auth key tags."
+            exit 1
+          fi
+
+          if ! jq -e '.Self.ExitNodeOption == true' <<< "$STATUS_JSON" >/dev/null; then
+            echo "::error::Exit-node approval is missing. Check autoApprovers.exitNode in the Tailscale policy."
+            exit 1
+          fi
+
+          TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1)"
+          test -n "$TAILSCALE_IP"
+          echo "Tailscale IPv4: $TAILSCALE_IP"
+          sudo tailscale status
+
+      # ================================================================
+      # 08. Restrict SSH and Ollama to the Tailscale interface
+      # ================================================================
+      - name: 08. Restrict Inbound SSH And Ollama Traffic
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          protect_port() {
+            local firewall="$1"
+            local port="$2"
+
+            command -v "$firewall" >/dev/null 2>&1 || return 0
+
+            # Insert DROP first, then insert the Tailscale ACCEPT above it.
+            # This blocks the same port on public interfaces while allowing
+            # connections that entered through tailscale0.
+            sudo "$firewall" -C INPUT -p tcp --dport "$port" -j DROP 2>/dev/null || \
+              sudo "$firewall" -I INPUT 1 -p tcp --dport "$port" -j DROP
+
+            sudo "$firewall" -C INPUT -i tailscale0 -p tcp --dport "$port" -j ACCEPT 2>/dev/null || \
+              sudo "$firewall" -I INPUT 1 -i tailscale0 -p tcp --dport "$port" -j ACCEPT
+          }
+
+          protect_port iptables "$SSH_PORT"
+          protect_port iptables "$OLLAMA_PORT"
+          protect_port ip6tables "$SSH_PORT"
+          protect_port ip6tables "$OLLAMA_PORT"
+
+          echo "IPv4 INPUT rules:"
+          sudo iptables -S INPUT | grep -E -- "--dport ($SSH_PORT|$OLLAMA_PORT)" || true
+          echo "IPv6 INPUT rules:"
+          sudo ip6tables -S INPUT | grep -E -- "--dport ($SSH_PORT|$OLLAMA_PORT)" || true
+
+      # ================================================================
+      # 09. Install and start SSH after firewall setup privileges
+      # ================================================================
+      - name: 09. Install And Start SSH Administrator
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Install OpenSSH only after the firewall has restricted port 22
+          # to tailscale0, so an automatic package post-install start is safe.
+          sudo apt-get install -y --no-install-recommends openssh-server
+          sudo install -d -m 0755 /etc/ssh/sshd_config.d
+          sudo tee /etc/ssh/sshd_config.d/00-vpn-runner.conf >/dev/null <<EOF
+          Port $SSH_PORT
+          PasswordAuthentication yes
+          PubkeyAuthentication yes
+          PermitRootLogin no
+          AllowUsers $SSH_USERNAME
+          MaxAuthTries 3
+          LoginGraceTime 30
+          EOF
+
+          sudo sshd -t
+          sudo systemctl enable --now ssh
+          sudo systemctl restart ssh
+          sudo ss -lntp | grep -E ":${SSH_PORT}[[:space:]]"
+          sudo -u "$SSH_USERNAME" sudo -n true
+          sudo -u "$SSH_USERNAME" sudo -n id
+          echo "SSH administrator verification passed."
+
+      # ================================================================
+      # 10. Notify that VPN and SSH are online
+      # ================================================================
+      - name: 10. Telegram VPN Online Notification
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1)"
+          ACTUAL_HOSTNAME="$(sudo tailscale status --self --json | jq -r '.Self.DNSName // .Self.HostName // "unknown"')"
+
+          MESSAGE="$(cat <<EOF
+          ✅ $ACTUAL_HOSTNAME is ONLINE
+          ━━━━━━━━━━━━━━━━━━━━
+          Tailscale IP: $TAILSCALE_IP
+          SSH: ssh $SSH_USERNAME@$TAILSCALE_IP -p $SSH_PORT
+          Ollama model: $OLLAMA_MODEL
+          Ollama API: http://$TAILSCALE_IP:$OLLAMA_PORT
+          OpenAI-compatible API: http://$TAILSCALE_IP:$OLLAMA_PORT/v1
+          Context: $OLLAMA_CONTEXT_LENGTH tokens
+          Runtime: $RUNNER_RUNTIME_MINUTES minutes
+
+          SSH and Ollama are restricted to the Tailscale interface.
+          EOF
+          )"
+
+          RESPONSE="$(curl --silent --show-error --fail --max-time 20 \
+            --request POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}")"
+
+          jq -e '.ok == true' <<< "$RESPONSE" >/dev/null
+          echo "VPN online notification sent."
+
+      # ================================================================
+      # 11. Install Ollama and bind it only to the Tailscale IPv4 address
+      # ================================================================
+      - name: 11. Install And Configure Ollama
+        id: ollama_install
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Runner memory before model installation:"
+          free -h
+          echo "Runner disk before model installation:"
+          df -h /
+
+          TOTAL_RAM_KB="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
+          AVAILABLE_RAM_KB="$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)"
+          MIN_AVAILABLE_RAM_KB=$((OLLAMA_MIN_AVAILABLE_RAM_GB * 1024 * 1024))
+
+          if (( TOTAL_RAM_KB < 14 * 1024 * 1024 )); then
+            echo "::error::This runner has less than 14 GiB of total RAM."
+            exit 1
+          fi
+
+          if (( AVAILABLE_RAM_KB < MIN_AVAILABLE_RAM_KB )); then
+            echo "::error::Only $((AVAILABLE_RAM_KB / 1024 / 1024)) GiB RAM is available; ${OLLAMA_MIN_AVAILABLE_RAM_GB} GiB is required before model loading."
+            exit 1
+          fi
+
+          MIN_FREE_DISK_KB=$((OLLAMA_MIN_FREE_DISK_GB * 1024 * 1024))
+          AVAILABLE_DISK_KB="$(df -Pk / | awk 'NR == 2 {print $4}')"
+
+          if (( AVAILABLE_DISK_KB < MIN_FREE_DISK_KB )); then
+            echo "Freeing unused preinstalled SDKs to make room for the model..."
+            sudo rm -rf \
+              /usr/share/dotnet \
+              /opt/ghc \
+              /usr/local/lib/android \
+              /opt/hostedtoolcache/CodeQL
+            sudo apt-get clean
+            AVAILABLE_DISK_KB="$(df -Pk / | awk 'NR == 2 {print $4}')"
+          fi
+
+          if (( AVAILABLE_DISK_KB < MIN_FREE_DISK_KB )); then
+            echo "::error::Insufficient disk space. Need at least ${OLLAMA_MIN_FREE_DISK_GB} GiB free."
+            df -h /
+            exit 1
+          fi
+
+          ollama_version() {
+            ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1
+          }
+
+          version_ge() {
+            [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" == "$2" ]]
+          }
+
+          INSTALLED_VERSION=""
+          if command -v ollama >/dev/null 2>&1; then
+            INSTALLED_VERSION="$(ollama_version || true)"
+          fi
+
+          if [[ -z "$INSTALLED_VERSION" ]] || ! version_ge "$INSTALLED_VERSION" "$OLLAMA_MIN_VERSION"; then
+            echo "Installing/upgrading Ollama..."
+            curl -fsSL https://ollama.com/install.sh | sh
+          fi
+
+          FINAL_VERSION="$(ollama_version || true)"
+          if [[ -z "$FINAL_VERSION" ]] || ! version_ge "$FINAL_VERSION" "$OLLAMA_MIN_VERSION"; then
+            echo "::error::Ollama version ${FINAL_VERSION:-unknown} is older than required ${OLLAMA_MIN_VERSION}."
+            exit 1
+          fi
+          echo "Ollama version: $FINAL_VERSION"
+
+          TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1)"
+          test -n "$TAILSCALE_IP"
+
+          sudo mkdir -p /etc/systemd/system/ollama.service.d
+          sudo tee /etc/systemd/system/ollama.service.d/override.conf >/dev/null <<EOF
+          [Service]
+          Environment="OLLAMA_HOST=${TAILSCALE_IP}:${OLLAMA_PORT}"
+          Environment="OLLAMA_KEEP_ALIVE=-1"
+          Environment="OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH}"
+          Environment="OLLAMA_MAX_LOADED_MODELS=1"
+          Environment="OLLAMA_NUM_PARALLEL=1"
+          EOF
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable ollama.service
+          sudo systemctl restart ollama.service
+
+          API_BASE="http://${TAILSCALE_IP}:${OLLAMA_PORT}"
+          for attempt in $(seq 1 45); do
+            if curl --silent --show-error --fail --max-time 5 "$API_BASE/api/version" >/dev/null; then
+              break
+            fi
+
+            if [[ "$attempt" -eq 45 ]]; then
+              sudo journalctl -u ollama.service --no-pager -n 100 || true
+              echo "::error::Ollama API did not start on the Tailscale address."
+              exit 1
+            fi
+            sleep 2
+          done
+
+          if ! sudo ss -lnt | grep -F ":${OLLAMA_PORT}" >/dev/null; then
+            echo "::error::Ollama is not listening on the expected port."
+            exit 1
+          fi
+
+          echo "Ollama API is available at $API_BASE"
+          echo "api_base=$API_BASE" >> "$GITHUB_OUTPUT"
+          free -h
+          df -h /
+
+      # ================================================================
+      # 12. Download only the model selected for this run
+      # ================================================================
+      - name: 12. Pull Selected Ollama Model
+        id: ollama_pull
+        if: steps.ollama_install.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 90
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1)"
+          export OLLAMA_HOST="${TAILSCALE_IP}:${OLLAMA_PORT}"
+
+          for attempt in 1 2 3; do
+            echo "Pulling $OLLAMA_MODEL (attempt $attempt/3)..."
+            if ollama pull "$OLLAMA_MODEL"; then
+              break
+            fi
+
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "::error::Failed to pull $OLLAMA_MODEL after three attempts."
+              exit 1
+            fi
+            sleep 15
+          done
+
+          echo "Installed model:"
+          ollama list
+          df -h /
+
+      # ================================================================
+      # 13. Load the model and test the local and Tailscale API
+      # ================================================================
+      - name: 13. Load Model And Verify Ollama API
+        id: ollama_verify
+        if: steps.ollama_pull.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1)"
+          API_BASE="http://${TAILSCALE_IP}:${OLLAMA_PORT}"
+
+          REQUEST_BODY="$(jq -n \
+            --arg model "$OLLAMA_MODEL" \
+            '{
+              model: $model,
+              prompt: "Reply with exactly: READY",
+              stream: false,
+              keep_alive: -1,
+              options: {
+                temperature: 0,
+                num_predict: 32
+              }
+            }')"
+
+          RESPONSE="$(curl --silent --show-error --fail \
+            --connect-timeout 10 \
+            --max-time 1500 \
+            --request POST \
+            "$API_BASE/api/generate" \
+            --header 'Content-Type: application/json' \
+            --data "$REQUEST_BODY")"
+
+          jq -e '(.response // "") | length > 0' <<< "$RESPONSE" >/dev/null
+          echo "Model response:"
+          jq -r '.response' <<< "$RESPONSE"
+
+          echo "Loaded model details:"
+          curl --silent --show-error --fail "$API_BASE/api/ps" | jq .
+
+          echo "OpenAI-compatible API models endpoint:"
+          curl --silent --show-error --fail "$API_BASE/v1/models" | jq .
+
+          echo "Memory after model load:"
+          free -h
+
+          echo "Model is loaded and the Ollama API is reachable through Tailscale."
+
+      # ================================================================
+      # 14. Report Ollama result, even if installation or model loading fails
+      # ================================================================
+      - name: 14. Telegram Ollama Status Notification
+        if: always() && steps.validate_config.outcome == 'success'
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OLLAMA_INSTALL_OUTCOME: ${{ steps.ollama_install.outcome }}
+          OLLAMA_PULL_OUTCOME: ${{ steps.ollama_pull.outcome }}
+          OLLAMA_VERIFY_OUTCOME: ${{ steps.ollama_verify.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1 || true)"
+
+          if [[ "$OLLAMA_VERIFY_OUTCOME" == 'success' ]]; then
+            MESSAGE="$(printf '%s\n' \
+              '✅ Ollama is READY' \
+              "Model: $OLLAMA_MODEL" \
+              "API: http://${TAILSCALE_IP}:${OLLAMA_PORT}" \
+              "OpenAI-compatible API: http://${TAILSCALE_IP}:${OLLAMA_PORT}/v1" \
+              "Context: ${OLLAMA_CONTEXT_LENGTH} tokens" \
+              "Runtime remaining: up to ${RUNNER_RUNTIME_MINUTES} minutes")"
+          else
+            MESSAGE="$(printf '%s\n' \
+              '⚠️ Ollama setup is incomplete' \
+              "Model: $OLLAMA_MODEL" \
+              "Install: ${OLLAMA_INSTALL_OUTCOME:-unknown}" \
+              "Pull: ${OLLAMA_PULL_OUTCOME:-skipped}" \
+              "Verify: ${OLLAMA_VERIFY_OUTCOME:-skipped}" \
+              'The VPN/SSH runner may still be online. Check the GitHub Actions logs.')"
+          fi
+
+          RESPONSE="$(curl --silent --show-error --fail --max-time 20 \
+            --request POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}")"
+          jq -e '.ok == true' <<< "$RESPONSE" >/dev/null
+
+      # ================================================================
+      # 15. Keep the ephemeral runner available
+      # ================================================================
+      - name: 15. Keep Runner Alive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          END_TIME="$(date -u -d "+${RUNNER_RUNTIME_MINUTES} minutes" +%s)"
+          echo "Keeping the runner online for up to ${RUNNER_RUNTIME_MINUTES} minutes."
+
+          while true; do
+            NOW="$(date -u +%s)"
+            REMAINING=$((END_TIME - NOW))
+
+            if (( REMAINING <= 0 )); then
+              echo "Requested online period completed."
+              break
+            fi
+
+            SLEEP_SECONDS=60
+            if (( SLEEP_SECONDS > REMAINING )); then
+              SLEEP_SECONDS="$REMAINING"
+            fi
+            sleep "$SLEEP_SECONDS"
+          done
+
+      # ================================================================
+      # 16. Tear down the Tailscale connection
+      # ================================================================
+      - name: 16. Tailscale Down
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo tailscale down || true
+          echo "Tailscale is down."
+
+      # ================================================================
+      # 17. Dispatch the next run only after a normal completion
+      # ================================================================
+      - name: 17. Start Next Workflow Run
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_REF: ${{ github.ref_name }}
+          GH_WORKFLOW_REF: ${{ github.workflow_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORKFLOW_FILE="${GH_WORKFLOW_REF%@*}"
+          WORKFLOW_FILE="${WORKFLOW_FILE##*/}"
+
+          echo "Repository: $GH_REPOSITORY"
+          echo "Branch: $GH_REF"
+          echo "Workflow file: $WORKFLOW_FILE"
+
+          curl --silent --show-error --fail-with-body \
+            --request GET \
+            --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}" \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --output /tmp/workflow-info.json
+
+          jq -r '"Workflow: \(.name)\nPath: \(.path)\nState: \(.state)"' /tmp/workflow-info.json
+
+          DISPATCH_BODY="$(jq -n \
+            --arg ref "$GH_REF" \
+            --arg model "$OLLAMA_MODEL" \
+            --arg minutes "$RUNNER_RUNTIME_MINUTES" \
+            '{
+              ref: $ref,
+              inputs: {
+                ollama_model: $model,
+                keep_runner_minutes: $minutes
+              }
+            }')"
+
+          HTTP_STATUS="$(curl --silent --show-error \
+            --output /tmp/workflow-dispatch-response.txt \
+            --write-out '%{http_code}' \
+            --request POST \
+            --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/dispatches" \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --header 'Content-Type: application/json' \
+            --data "$DISPATCH_BODY")"
+
+          echo "Workflow dispatch HTTP status: $HTTP_STATUS"
+          if [[ "$HTTP_STATUS" != '204' && "$HTTP_STATUS" != '200' ]]; then
+            echo "::error::Could not dispatch the next workflow run."
+            cat /tmp/workflow-dispatch-response.txt || true
+            exit 1
+          fi
+
+          echo "Next workflow run was queued with model $OLLAMA_MODEL."
